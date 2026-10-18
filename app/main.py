@@ -1,3 +1,5 @@
+import asyncio
+import random
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from .db import connection, init_db, seed_db
@@ -15,10 +17,51 @@ class EventHub:
 
 hub = EventHub()
 simulation_enabled = True
+_sim_task: asyncio.Task | None = None
+
+_SYNTHETIC_INCIDENTS = [
+    ("Road traffic collision",   "Multiple vehicles involved, possible trapped persons", 5),
+    ("Structure fire",           "Smoke and flames at residential building, fire spreading", 5),
+    ("Medical emergency",        "Cardiac arrest reported, bystander CPR in progress", 4),
+    ("Flooding",                 "Low-lying area flooding after heavy rain, vehicles stranded", 4),
+    ("Gas leak",                 "Strong gas odour near commercial district, evacuation advised", 3),
+    ("Power line down",          "Downed live cable blocking road after storm damage", 3),
+    ("Missing person",           "Vulnerable adult reported missing, last seen near riverbank", 2),
+    ("Minor collision",          "Fender bender with minor injuries, road partially blocked", 2),
+]
+
+async def incident_generator():
+    """Generate a synthetic incident every 15 s when simulation_enabled is True."""
+    lat_base, lon_base = 40.72, -74.00
+    while True:
+        await asyncio.sleep(15)
+        if not simulation_enabled:
+            continue
+        title, description, severity = random.choice(_SYNTHETIC_INCIDENTS)
+        lat = round(lat_base + random.uniform(-0.05, 0.05), 4)
+        lon = round(lon_base + random.uniform(-0.05, 0.05), 4)
+        score, level = risk_assessment(severity, description)
+        with connection() as c:
+            cur = c.execute(
+                """INSERT INTO incidents(title,description,latitude,longitude,severity,created_at,risk_score,risk_level)
+                   VALUES(?,?,?,?,?,?,?,?)""",
+                (title, description, lat, lon, severity, now(), score, level),
+            )
+            audit(c, "simulate", "incident", cur.lastrowid, {"auto": True})
+            result = row_dict(c.execute("SELECT * FROM incidents WHERE id=?", (cur.lastrowid,)).fetchone())
+        await hub.publish({"type": "incident.created", "incident": result})
 
 @asynccontextmanager
 async def lifespan(app):
-    init_db(); seed_db(); yield
+    global _sim_task
+    init_db(); seed_db()
+    _sim_task = asyncio.create_task(incident_generator())
+    yield
+    _sim_task.cancel()
+    try:
+        await _sim_task
+    except asyncio.CancelledError:
+        pass
 
 app = FastAPI(title="RESQ-Z AI", version="0.1.0", lifespan=lifespan)
 
@@ -199,10 +242,23 @@ def simulation_pause():
     return {"enabled": simulation_enabled}
 
 @app.post("/simulation/reset")
-def simulation_reset():
+async def simulation_reset():
     global simulation_enabled
     simulation_enabled = False
-    return {"enabled": simulation_enabled, "message": "Simulation reset; seeded data is restored on process restart."}
+    with connection() as c:
+        # Delete in FK-safe order
+        c.execute("DELETE FROM recommendations")
+        c.execute("DELETE FROM allocations")
+        c.execute("DELETE FROM audit_log")
+        c.execute("DELETE FROM incidents")
+        c.execute("DELETE FROM resources")
+        # Reset auto-increment counters so IDs restart from 1
+        c.execute("DELETE FROM sqlite_sequence WHERE name IN ('incidents','resources','allocations','recommendations','audit_log')")
+    seed_db()
+    with connection() as c:
+        incidents = [row_dict(r) for r in c.execute("SELECT * FROM incidents ORDER BY id ASC")]
+    await hub.publish({"type": "simulation.reset", "incidents": incidents})
+    return {"enabled": False, "message": "Simulation reset; seed data restored."}
 
 @app.websocket("/ws/events")
 async def events(websocket: WebSocket):
