@@ -3,7 +3,7 @@
 This project uses Python and SQLite rather than architecture-specific binaries.
 The dependency set is intentionally small, but this repository has **not** been
 deployed or certified on IBM LinuxONE. Verify every package in the target
-environment before a production-like demonstration.
+environment before a production-like demonstration. Event code is SSF2026 .
 
 ## Prepare the host
 
